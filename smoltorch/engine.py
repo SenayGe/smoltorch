@@ -9,9 +9,13 @@ USE_MLX = platform.processor() == "arm" and platform.system() == "Darwin"
 
 # Import appropriate backend
 if USE_MLX:
-    import mlx.core as mx
+    try:
+        import mlx.core as mx
 
-    BACKEND = mx
+        BACKEND = mx
+    except ImportError:
+        BACKEND = np
+
 else:
     BACKEND = np
 # TODO: add option for JAX
