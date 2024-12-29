@@ -21,7 +21,7 @@ else:
 # TODO: add option for JAX
 
 
-class Tenosor:
+class Tensor:
 
     _compute_grad = True
 
@@ -55,3 +55,31 @@ class Tenosor:
         # Gradient related attributes
         self._ctx = None  # holds the operation context
         self.requires_grad = requires_grad and self._compute_grad
+        self._backward = None  # function to compute local grad
+        self.grad = (
+            None if not self.requires_grad else self.backend.zeros_like(self.data)
+        )
+
+        self.shape = self.data.shape
+        self.ndim = len(self.data.shape)
+
+        def __add__(self, other) -> "Tensor":
+
+            other = other if isinstance(other, Tensor) else Tensor(other)
+
+            out = Tensor(
+                self.data + other.data,
+                requires_grad=self.requires_grad or other.requires_grad,
+            )
+
+            if out.requires_grad:
+                out._ctx = (self, other)
+
+                def _backward():
+                    if self.requires_grad:
+                        # I am using the backend's add function to avoid recursion and maintain consistency
+                        self.grad = self.backend.add(self.grad, out.grad)
+                    if other.requires_grad:
+                        other.grad = self.backend.add(other.grad, out.grad)
+
+                out._backward = _backward
