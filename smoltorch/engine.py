@@ -63,23 +63,41 @@ class Tensor:
         self.shape = self.data.shape
         self.ndim = len(self.data.shape)
 
-        def __add__(self, other) -> "Tensor":
+    def __add__(self, other) -> "Tensor":
 
-            other = other if isinstance(other, Tensor) else Tensor(other)
+        other = other if isinstance(other, Tensor) else Tensor(other)
 
-            out = Tensor(
-                self.data + other.data,
-                requires_grad=self.requires_grad or other.requires_grad,
-            )
+        out_data = self.data + other.data
+        out = Tensor(
+            out_data,
+            requires_grad=self.requires_grad or other.requires_grad,
+        )
 
-            if out.requires_grad:
-                out._ctx = (self, other)
+        if out.requires_grad:
+            out._ctx = (self, other)
 
-                def _backward():
-                    if self.requires_grad:
-                        # I am using the backend's add function to avoid recursion and maintain consistency
-                        self.grad = self.backend.add(self.grad, out.grad)
-                    if other.requires_grad:
-                        other.grad = self.backend.add(other.grad, out.grad)
+            def _backward():
+                if self.requires_grad:
+                    # TODO: implement broadcasting
+                    self.grad = self.backend.add(self.grad, out.grad)
+                if other.requires_grad:
+                    other.grad = self.backend.add(other.grad, out.grad)
 
-                out._backward = _backward
+            out._backward = _backward
+
+        return out
+
+    def __repr__(self):
+        return f"Tensor({self.data})"
+
+
+if __name__ == "__main__":
+    a = Tensor([[1, 2, 3], [4, 5, 6]])
+    b = Tensor([1, 1, 1])
+
+    print(a.shape)
+    print(b.shape)
+    c = a + b
+
+    print(c)
+    print(c.shape)
