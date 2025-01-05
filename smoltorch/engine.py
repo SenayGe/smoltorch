@@ -1,10 +1,10 @@
 import platform
 from contextlib import contextmanager
-from typing import *
+from typing import Any, Tuple
 
 import numpy as np
 
-# if running on apple silicon
+# Check if running on Apple Silicon
 USE_MLX = platform.processor() == "arm" and platform.system() == "Darwin"
 
 # Import appropriate backend
@@ -15,29 +15,113 @@ if USE_MLX:
         BACKEND = mx
     except ImportError:
         BACKEND = np
-
 else:
     BACKEND = np
-# TODO: add option for JAX
 
 
 class OpContext:
-    """Stores operation context for better debugging."""
+    """Stores operation info and values needed for backward pass."""
 
-    op_type: str
-    inputs: Tuple["Tensor", ...]
-    saved_tensors: Tuple[Any, ...] = ()
-    saved_values: dict = None
+    def __init__(self):
+        self.op: str = None
+        self.inputs: Tuple["Tensor", ...] = None  # for gradient accumulation
+        self.saved_tensors: Tuple[Any, ...] = ()  # for computing gradients
+
+
+class Function:
+    @staticmethod
+    def forward(ctx: OpContext, *args, **kwargs):
+        raise NotImplementedError
+
+    @staticmethod
+    def backward(ctx: OpContext, grad_output):
+        raise NotImplementedError
+
+    @classmethod
+    def apply(cls, *args):
+        # If gradient computation is disabled, just run forward pass
+        if not Tensor._compute_grad:
+            return cls.forward(OpContext(), *args)
+
+        ctx = OpContext()
+        ctx.op = cls.__name__
+        ctx.inputs = args
+
+        # Run forward pass
+        output = cls.forward(ctx, *args)
+
+        # Check if any input requires gradient
+        requires_grad = any(
+            isinstance(arg, Tensor) and arg.requires_grad for arg in args
+        )
+
+        if requires_grad:
+            output._ctx = ctx
+
+            def _backward():
+                grads = cls.backward(ctx, output.grad)
+                if not isinstance(grads, tuple):
+                    grads = (grads,)
+                for inp, grad in zip(ctx.inputs, grads):
+                    if inp.requires_grad:
+                        inp.grad = BACKEND.add(inp.grad, grad)
+
+            output._backward = _backward
+
+        return output
+
+
+class Add(Function):
+    @staticmethod
+    def forward(ctx: OpContext, x: "Tensor", y: "Tensor"):
+        return Tensor(x.data + y.data, requires_grad=x.requires_grad or y.requires_grad)
+
+    @staticmethod
+    def backward(ctx: OpContext, grad_output):
+        return grad_output, grad_output
+
+
+class Mul(Function):
+    @staticmethod
+    def forward(ctx: OpContext, x: "Tensor", y: "Tensor"):
+        ctx.saved_tensors = (x, y)  # Need both inputs for gradient computation
+        return Tensor(x.data * y.data, requires_grad=x.requires_grad or y.requires_grad)
+
+    @staticmethod
+    def backward(ctx: OpContext, grad_output):
+        x, y = ctx.saved_tensors
+        return y.data * grad_output, x.data * grad_output  # Uses saved x, y values
+
+
+class MatMul(Function):
+    @staticmethod
+    def forward(ctx: OpContext, x: "Tensor", y: "Tensor"):
+        ctx.saved_tensors = (x, y)  # Need both inputs for gradient computation
+        return Tensor(x.data @ y.data, requires_grad=x.requires_grad or y.requires_grad)
+
+    @staticmethod
+    def backward(ctx: OpContext, grad_output):
+        x, y = ctx.saved_tensors
+
+        def swap_last_two_axes(x):
+            num_axes = len(x.shape)
+            axes = list(range(num_axes))
+            axes[-2], axes[-1] = axes[-1], axes[-2]
+            return BACKEND.transpose(x, axes)
+
+        # Uses saved x, y values for transpose operations
+        grad_x = BACKEND.matmul(grad_output, swap_last_two_axes(y.data))
+        grad_y = BACKEND.matmul(swap_last_two_axes(x.data), grad_output)
+
+        return grad_x, grad_y
 
 
 class Tensor:
-
     _compute_grad = True
 
     @classmethod
     @contextmanager
     def no_grad(cls):
-        """Context manager to temporarily disable gradient computation"""
         prev = cls._compute_grad
         cls._compute_grad = False
         try:
@@ -49,7 +133,7 @@ class Tensor:
         self.backend = BACKEND
         self.dtype = dtype or self.backend.float32
 
-        # convert data to array
+        # Convert data to array
         if isinstance(data, (int, float)):
             self.data = self.backend.array([data], dtype=self.dtype)
         elif isinstance(data, (list, tuple)):
@@ -62,9 +146,9 @@ class Tensor:
             raise ValueError(f"Unsupported data type: {type(data)}")
 
         # Gradient related attributes
-        self._ctx = None  # holds the operation context
+        self._ctx = None  # Context for backward pass
         self.requires_grad = requires_grad and self._compute_grad
-        self._backward = None  # function to compute local grad
+        self._backward = None
         self.grad = (
             None if not self.requires_grad else self.backend.zeros_like(self.data)
         )
@@ -73,92 +157,20 @@ class Tensor:
         self.ndim = len(self.data.shape)
 
     def __add__(self, other) -> "Tensor":
-
         other = other if isinstance(other, Tensor) else Tensor(other)
+        return Add.apply(self, other)
 
-        out_data = self.data + other.data
-        out = Tensor(
-            out_data,
-            requires_grad=self.requires_grad or other.requires_grad,
-        )
-
-        if out.requires_grad:
-            out._ctx = (self, other)
-
-            def _backward():
-                if self.requires_grad:
-                    # TODO: implement broadcasting
-                    self.grad = self.backend.add(self.grad, out.grad)
-                if other.requires_grad:
-                    other.grad = self.backend.add(other.grad, out.grad)
-
-            out._backward = _backward
-
-        return out
-
-    def __mul__(self, other):
+    def __mul__(self, other) -> "Tensor":
         other = other if isinstance(other, Tensor) else Tensor(other)
-        out_data = self.data * other.data  # z = x * y
-        out = Tensor(
-            out_data,
-            requires_grad=self.requires_grad or other.requires_grad,
-        )
+        return Mul.apply(self, other)
 
-        if out.requires_grad:
-            out._ctx = (self, other)
-
-            def _backward():
-
-                # x.grad = ∂L/∂x = ∂L/∂z * ∂z/∂x = out.grad * y
-                # y.grad = ∂L/∂y = ∂L/∂z * ∂z/∂y = out.grad * x
-                if self.requires_grad:
-                    # TODO: implement broadcasting
-                    self.grad = self.backend.add(self.grad, other.data * out.grad)
-                if other.requires_grad:
-                    other.grad = self.backend.add(other.grad, self.data * out.grad)
-
-            out._backward = _backward
-
-        return out
-
-    def __matmul__(self, other):
+    def __matmul__(self, other) -> "Tensor":
         other = other if isinstance(other, Tensor) else Tensor(other)
-        out_data = self.data @ other.data  # Z = X @ Y
-        out = Tensor(
-            out_data,
-            requires_grad=self.requires_grad or other.requires_grad,
-        )
-
-        if out.requires_grad:
-            out._ctx = (self, other)
-
-            def swap_last_two_axes(x):
-                num_axes = len(x.shape)
-                axes = list(range(num_axes))
-                axes[-2], axes[-1] = axes[-1], axes[-2]
-                return self.backend.transpose(x, axes)
-
-            def _backward():
-
-                # ∂Z/∂X = grad_Z @ Y.T
-                # ∂Z/∂Y = X.T @ grad_Z
-                if self.requires_grad:
-                    grad_x = self.backend.matmul(
-                        out.grad, swap_last_two_axes(other.data)
-                    )
-                    self.grad = self.backend.add(self.grad, grad_x)
-                if other.requires_grad:
-                    grad_y = self.backend.matmul(
-                        swap_last_two_axes(self.data), out.grad
-                    )
-                    other.grad = self.backend.add(other.grad, grad_y)
-
-            out._backward = _backward
-
-        return out
+        return MatMul.apply(self, other)
 
     def __repr__(self):
-        return f"Tensor({self.data})"
+        op_str = f" (op: {self._ctx.op})" if self._ctx and self._ctx.op else ""
+        return f"Tensor({self.data}{op_str})"
 
 
 if __name__ == "__main__":
@@ -167,13 +179,12 @@ if __name__ == "__main__":
 
     # print(a.shape)
     # print(b.shape)
-    c = a * b
+    c = a + b
     print(c)
     print(c.shape)
 
     x_data = [[1.0, 2.0], [3.0, 4.0]]
     y_data = [[5.0, 6.0], [7.0, 8.0]]
-
     # smolTorch
     x_st = Tensor(x_data, requires_grad=True)
     y_st = Tensor(y_data, requires_grad=True)
